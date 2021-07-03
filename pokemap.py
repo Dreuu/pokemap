@@ -1,7 +1,5 @@
-#!/usr/bin/env python3.3
-
 import nlzss.lzss3
-import pygame
+from PIL import Image
 import struct
 import sys
 import argparse
@@ -19,11 +17,11 @@ def main():
                       help="Print information while running to help debug", action="store_true",
                       dest="verbose")
   parser.add_argument('rom_file', metavar='rom', type=str,
-                       help='a fire red rom')
+                       help='a fire red rom', nargs='?', default=None)
   parser.add_argument("-o","--outfile",
                       help="Specify the output file name/extension",
                       action=CheckExt({'png','bmp','jpeg','tga'}),
-                      default='wholemap.bmp')
+                      default='wholemap.png')
   parser.add_argument("--headless",
                       help="Run the script in headless mode (no gui!)",
                       action="store_true")
@@ -36,12 +34,27 @@ def main():
   global DEBUG_MODE
   if args.verbose:
     DEBUG_MODE = True
+  frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'}
+  emHackOffsets = {'strings':'0x5bc378', 'banks':'0x49e8c0'}
+  global GAME
+  GAME = 'fr'
+  chosenROM = frOffsets
 
+  if args.rom_file is None:
+    args.rom_file = 'firered.gba'
+
+  print()
+  print('Reading ROM:',args.rom_file)
   bytes = load_rom(args.rom_file)
-  strings = load_strings(bytes, '0x3eecfc')
+  print()
+  
+  strings = load_strings(bytes, chosenROM['strings'])
   debug('Found all these strings: {}'.format([x.encode('utf-8') for x in strings]))
-  banks = load_maps(bytes, '0x3526A8')
-  offsets = calculate_map_offsets(banks, 3, 0)
+  banks = load_maps(bytes, chosenROM['banks'])
+  if GAME == 'em':
+    offsets = calculate_map_offsets(banks, 0, 9)
+  else:
+    offsets = calculate_map_offsets(banks, 3, 0) # FireRed
   min_x = min([x for ((m, b), (x, y)) in offsets])
   min_y = min([y for ((m, b), (x, y)) in offsets])
   max_x = max([x + banks[m][b]['width'] for ((m, b), (x, y)) in offsets])
@@ -52,24 +65,28 @@ def main():
   x_orig = min_x * 16
   y_orig = min_y * 16
 
-  pygame.init()
-  screen = pygame.display.set_mode((width, height))
-  screen.fill((255, 0, 255))
-  screen.set_colorkey((255, 0, 255))
+  map_im = Image.new(mode="RGBA", size=(width, height), color=(255,0,255,0))
+  map_pixels = map_im.load()
 
   if args.headless:
     print("Working!...")
 
+  # Recursively finds maps surrounding initial one
+  # Requires the overworld to be connected using one long sequential path
+  # Could manually add all required OW maps maybe?
+  current = 1
+  offset_count = len(offsets)
   for ((m, b), (x, y)) in offsets:
-    draw_map(screen, bytes, banks[m][b]['map_data'], (x - min_x) * 16, (y - min_y) * 16)
-    pygame.display.flip()
-
-  screen = screen.convert_alpha()
-  pygame.image.save(screen, args.outfile)
+    print(f'Drawing map {current}/{offset_count}', end='\r')
+    draw_map(map_pixels, bytes, banks[m][b]['map_data'], (x - min_x) * 16, (y - min_y) * 16)
+    current += 1
+    
+  print('\n\nSaving Image:',args.outfile,'\n')
+  if args.outfile.split('.')[-1] == 'jpeg':
+    map_im = map_im.convert('RGB')
+  map_im.save(args.outfile, args.outfile.split('.')[-1])
   if args.headless:
     print("done!")
-
-  pygame.quit()
 
 def load_rom(rom_path):
   return open(rom_path, 'rb').read()
@@ -115,25 +132,34 @@ def load_strings(bytes, hex_offset):
 
 def load_maps(bytes, hex_offset):
   offset = int(hex_offset, 16)
-
+  
   bank_pointers = []
   while is_pointer(bytes, offset):
     bank_pointer = read_pointer(bytes, offset)
-    bank_pointers.append(bank_pointer)
+    if bank_pointer == 4160749567:
+      pass
+    else:
+      bank_pointers.append(bank_pointer)
     offset = offset + 4
 
   debug('Found these bank pointers: {}'.format(bank_pointers))
 
   banks = []
+  increment = 0
   for i, bank_pointer in enumerate(bank_pointers):
+    if bank_pointer == 0:
+      continue
+    increment += 1
     offset = bank_pointer
     next_pointer = bank_pointers[i + 1] if (i + 1) < len(bank_pointers) else 0
-    if i == 42:
+    if increment == 42:
       break
 
     maps = []
     while is_pointer(bytes, offset):
       map_data = read_pointer(bytes, offset)
+      if map_data < 0:
+        continue
       cs = read_connections(bytes, map_data)
 
       map_pointer = read_pointer(bytes, map_data)
@@ -163,6 +189,8 @@ def read_connections(bytes, map_data):
   connections = read_pointer(bytes, map_data + 12)
   n_connections = read_int(bytes, connections)
   offset = read_pointer(bytes, connections + 4)
+  if n_connections > 10 or offset < 0:
+    return cs
   debug('Reading connections at {:#x}'.format(offset))
   for i in range(n_connections):
     cs.append({
@@ -245,6 +273,8 @@ def read_tileset(bytes, tileset_pointer):
 
   offset = read_pointer(bytes, tileset_pointer + 12)
   end = read_pointer(bytes, tileset_pointer + 20)
+  if GAME == 'em':
+    end = read_pointer(bytes, tileset_pointer + 16)
   total_blocks = (end - offset) / 16
   debug('trying to read {} blocks'.format(total_blocks))
   blocks = []
@@ -274,7 +304,7 @@ def read_block(bytes, offset, i):
     block.append((palette, tile, attributes))
   return block
 
-def draw_block(screen, palettes, tiles, blocks, x, y, block_num):
+def draw_block(map_pixels, palettes, tiles, blocks, x, y, block_num):
   # The first four tiles are the bottom tiles and the last four are the top
   # ones. The top tiles also have a mask to them, so we have to draw them
   # differently.
@@ -282,10 +312,10 @@ def draw_block(screen, palettes, tiles, blocks, x, y, block_num):
   for i, (palette, tile, attributes) in enumerate(block):
     x_offset = (i % 2) * 8
     y_offset = int((i % 4) / 2) * 8
-    draw_tile(screen, palettes[palette], tiles[tile],
+    draw_tile(map_pixels, palettes[palette], tiles[tile],
       x + x_offset, y + y_offset, attributes, i >= 4)
 
-def draw_tile(screen, palette, tile, x, y, attributes, mask_mode):
+def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
   x_flip = attributes & 0x1
   y_flip = attributes & 0x2
   for i, px in enumerate(tile):
@@ -300,19 +330,11 @@ def draw_tile(screen, palette, tile, x, y, attributes, mask_mode):
     if mask_mode and px == 0:
       continue
     colour = palette[px]
-    screen.set_at((x + x_offset, y + y_offset), colour)
+    map_pixels[x + x_offset, y + y_offset] = colour + (255,)
 
-def draw_and_save_map(screen, bytes, map_, strings):
-  screen.fill((255, 255, 255))
-
-  label = draw_map(screen, bytes, map_, 0, 0)
-
-  pygame.display.flip()
-
-  name = strings[label - 88]
-  pygame.image.save(screen, 'maps/{}.bmp'.format(name))
-
-def draw_map(screen, bytes, map_, xx, yy):
+def draw_map(map_pixels, bytes, map_, xx, yy):
+  if read_pointer(bytes, map_) < 0:
+    return
   (width, height, label, tile_sprites, global_pointer, local_pointer) = read_map(bytes, map_)
   (palettes, tiles, blocks) = read_tileset(bytes, global_pointer)
   (extra_palettes, extra_tiles, extra_blocks) = read_tileset(bytes, local_pointer)
@@ -321,7 +343,7 @@ def draw_map(screen, bytes, map_, xx, yy):
   blocks.extend(extra_blocks)
 
   for (x, y) in tile_sprites:
-    draw_block(screen, palettes, tiles, blocks, xx + x * 16, yy + y * 16, tile_sprites[(x, y)])
+    draw_block(map_pixels, palettes, tiles, blocks, xx + x * 16, yy + y * 16, tile_sprites[(x, y)])
 
   return label
 
@@ -372,6 +394,8 @@ def calculate_map_offsets(maps, bank_num, map_num):
     (0, 0), 0xf, 0)
 
 def is_pointer(bytes, offset):
+  if(len(str(offset)) >= 8):
+    return False
   return read_pointer(bytes, offset) > 0
 
 def read_pointer(bytes, offset):
@@ -379,9 +403,13 @@ def read_pointer(bytes, offset):
   return read_int(bytes, offset) - load_address
 
 def read_uint(bytes, offset):
+  if(len(str(offset)) >= 8):
+    return 0
   return struct.unpack(b'<i', bytes[offset:(offset + 4)])[0]
 
 def read_int(bytes, offset):
+  if(len(str(offset)) >= 8):
+    return 0
   return struct.unpack(b'<I', bytes[offset:(offset + 4)])[0]
 
 def CheckExt(choices):
