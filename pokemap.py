@@ -5,48 +5,73 @@ import sys
 import argparse
 import os
 
-DEBUG_MODE = False
 def debug(*args, **kwargs):
   if DEBUG_MODE:
     print(*args, **kwargs)
 
 def main():
+  global DEBUG_MODE
+  global GAME
+  global frOffsets
+  global emOffsets
+  global gameIdOffset
+
+  DEBUG_MODE = False
+  frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'}
+  emOffsets = {'strings':'0x5A0B2C', 'banks':'0x486578'}
+  gameIdOffset = '0xAC'
+  chosenROM = None
 
   parser = argparse.ArgumentParser(description="do a wee bit o' data rippin from a rom")
   parser.add_argument("-v", "--verbose",
                       help="Print information while running to help debug", action="store_true",
                       dest="verbose")
   parser.add_argument('rom_file', metavar='rom', type=str,
-                       help='a fire red rom', nargs='?', default=None)
+                       help='a fire red or emerald rom') #, nargs='?', default='pokeemerald.gba')
   parser.add_argument("-o","--outfile",
                       help="Specify the output file name/extension",
                       action=CheckExt({'png','bmp','jpeg','tga'}),
-                      default='wholemap.png')
-  parser.add_argument("--headless",
-                      help="Run the script in headless mode (no gui!)",
-                      action="store_true")
+                      default=None)
+  parser.add_argument("-g","--game",
+                      help="Specify which game the ROM contains. Options are 'fr' and 'em'",
+                      default=None)
   args = parser.parse_args()
 
-  if args.headless:
-    import os
-    os.environ["SDL_VIDEODRIVER"] = "dummy" #this works on my ubuntu machine, but untested on others.
+  GAME = args.game
 
-  global DEBUG_MODE
   if args.verbose:
     DEBUG_MODE = True
-  frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'}
-  emHackOffsets = {'strings':'0x5bc378', 'banks':'0x49e8c0'}
-  global GAME
-  GAME = 'fr'
-  chosenROM = frOffsets
 
   if args.rom_file is None:
-    args.rom_file = 'firered.gba'
+    if GAME == 'fr' and os.path.isfile('pokefirered.gba'):
+      args.rom_file = 'pokefirered.gba'
+    elif GAME == 'em' and os.path.isfile('pokeemerald.gba'):
+      args.rom_file = 'pokeemerald.gba'
+    else:
+      print('usage: pokemap.py [-h] [-v] [-o OUTFILE] [-g GAME] rom')
+      print('pokemap.py: error: the following arguments are required: rom')
+      quit()
 
   print()
   print('Reading ROM:',args.rom_file)
   bytes = load_rom(args.rom_file)
   print()
+
+  if GAME is None:
+    game_id = read_uint(bytes, gameIdOffset)
+    game_id = hex(game_id)
+    if game_id == '0x45525042':
+      GAME = 'fr'
+    elif game_id == '0x45455042':
+      GAME = 'em'
+
+  if args.outfile is None:
+    args.outfile = f'{GAME}_wholemap.png'
+
+  if GAME == 'fr':
+    chosenROM = frOffsets
+  else:
+    chosenROM = emOffsets
   
   strings = load_strings(bytes, chosenROM['strings'])
   debug('Found all these strings: {}'.format([x.encode('utf-8') for x in strings]))
@@ -68,9 +93,6 @@ def main():
   map_im = Image.new(mode="RGBA", size=(width, height), color=(255,0,255,0))
   map_pixels = map_im.load()
 
-  if args.headless:
-    print("Working!...")
-
   # Recursively finds maps surrounding initial one
   # Requires the overworld to be connected using one long sequential path
   # Could manually add all required OW maps maybe?
@@ -85,8 +107,6 @@ def main():
   if args.outfile.split('.')[-1] == 'jpeg':
     map_im = map_im.convert('RGB')
   map_im.save(args.outfile, args.outfile.split('.')[-1])
-  if args.headless:
-    print("done!")
 
 def load_rom(rom_path):
   return open(rom_path, 'rb').read()
@@ -312,8 +332,11 @@ def draw_block(map_pixels, palettes, tiles, blocks, x, y, block_num):
   for i, (palette, tile, attributes) in enumerate(block):
     x_offset = (i % 2) * 8
     y_offset = int((i % 4) / 2) * 8
-    draw_tile(map_pixels, palettes[palette], tiles[tile],
-      x + x_offset, y + y_offset, attributes, i >= 4)
+    if tile <= len(tiles):
+      draw_tile(map_pixels, palettes[palette], tiles[tile],
+        x + x_offset, y + y_offset, attributes, i >= 4)
+    else:
+      print('Tileerror')
 
 def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
   x_flip = attributes & 0x1
@@ -405,6 +428,8 @@ def read_pointer(bytes, offset):
 def read_uint(bytes, offset):
   if(len(str(offset)) >= 8):
     return 0
+  if isinstance(offset, str):
+    offset = int(offset, 16)
   return struct.unpack(b'<i', bytes[offset:(offset + 4)])[0]
 
 def read_int(bytes, offset):
