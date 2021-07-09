@@ -13,12 +13,20 @@ def main():
   global DEBUG_MODE
   global GAME
   global frOffsets
+  global lgOffsets
   global emOffsets
+  global ruOffsets
+  global saOffsets
   global gameIdOffset
 
   DEBUG_MODE = False
-  frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'}
-  emOffsets = {'strings':'0x5A0B2C', 'banks':'0x486578'}
+  frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'} # For hacks, check pointer at 0x5524C
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x3528DC'} # Gaia - Broken but working
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0xB70498'} # Unbound - Not working
+  lgOffsets = {'strings':'0x3eecfc', 'banks':'0x352688'} # Wrong strings offset
+  emOffsets = {'strings':'0x5A0B2C', 'banks':'0x486578'} # For hacks, check pointer at 0x84AA4
+  ruOffsets = {'strings':'0x5A0B2C', 'banks':'0x308588'} # Wrong strings offset
+  saOffsets = {'strings':'0x5A0B2C', 'banks':'0x308518'} # Wrong strings offset
   gameIdOffset = '0xAC'
   chosenROM = None
 
@@ -27,7 +35,7 @@ def main():
                       help="Print information while running to help debug", action="store_true",
                       dest="verbose")
   parser.add_argument('rom_file', metavar='rom', type=str,
-                       help='a fire red or emerald rom') #, nargs='?', default='pokeemerald.gba')
+                       help='a fire red or emerald rom')
   parser.add_argument("-o","--outfile",
                       help="Specify the output file name/extension",
                       action=CheckExt({'png','bmp','jpeg','tga'}),
@@ -42,44 +50,48 @@ def main():
   if args.verbose:
     DEBUG_MODE = True
 
-  if args.rom_file is None:
-    if GAME == 'fr' and os.path.isfile('pokefirered.gba'):
-      args.rom_file = 'pokefirered.gba'
-    elif GAME == 'em' and os.path.isfile('pokeemerald.gba'):
-      args.rom_file = 'pokeemerald.gba'
-    else:
-      print('usage: pokemap.py [-h] [-v] [-o OUTFILE] [-g GAME] rom')
-      print('pokemap.py: error: the following arguments are required: rom')
-      quit()
-
   print()
   print('Reading ROM:',args.rom_file)
   bytes = load_rom(args.rom_file)
   print()
 
+  # Set default GAME type based on hex header
+  # BPRE, BPGE, BPEE...
   if GAME is None:
     game_id = read_uint(bytes, gameIdOffset)
     game_id = hex(game_id)
     if game_id == '0x45525042':
       GAME = 'fr'
+    if game_id == '0x45475042':
+      GAME = 'lg'
     elif game_id == '0x45455042':
       GAME = 'em'
+    elif game_id == '0x45565841':
+      GAME = 'ru'
+    elif game_id == '0x45505841':
+      GAME = 'sa'
 
+  # Set default output filename
   if args.outfile is None:
     args.outfile = f'{GAME}_wholemap.png'
 
+  # Set offset of map groups
   if GAME == 'fr':
     chosenROM = frOffsets
-  else:
+  elif GAME == 'lg':
+    chosenROM = lgOffsets
+  elif GAME == 'em':
     chosenROM = emOffsets
+  elif GAME == 'ru':
+    chosenROM = ruOffsets
+  elif GAME == 'sa':
+    chosenROM = saOffsets
   
   strings = load_strings(bytes, chosenROM['strings'])
   debug('Found all these strings: {}'.format([x.encode('utf-8') for x in strings]))
   banks = load_maps(bytes, chosenROM['banks'])
-  if GAME == 'em':
-    offsets = calculate_map_offsets(banks, 0, 9)
-  else:
-    offsets = calculate_map_offsets(banks, 3, 0) # FireRed
+  map_bank, map_number = get_longest_connection(banks)
+  offsets = calculate_map_offsets(banks, map_bank, map_number)
   min_x = min([x for ((m, b), (x, y)) in offsets])
   min_y = min([y for ((m, b), (x, y)) in offsets])
   max_x = max([x + banks[m][b]['width'] for ((m, b), (x, y)) in offsets])
@@ -104,7 +116,7 @@ def main():
     current += 1
     
   print('\n\nSaving Image:',args.outfile,'\n')
-  if args.outfile.split('.')[-1] == 'jpeg':
+  if args.outfile.split('.')[-1] == 'jpeg': # No transparency
     map_im = map_im.convert('RGB')
   map_im.save(args.outfile, args.outfile.split('.')[-1])
 
@@ -156,10 +168,10 @@ def load_maps(bytes, hex_offset):
   bank_pointers = []
   while is_pointer(bytes, offset):
     bank_pointer = read_pointer(bytes, offset)
-    if bank_pointer == 4160749567:
-      pass
-    else:
-      bank_pointers.append(bank_pointer)
+    #if bank_pointer == 4160749567:
+    #  pass
+    #else:
+    bank_pointers.append(bank_pointer)
     offset = offset + 4
 
   debug('Found these bank pointers: {}'.format(bank_pointers))
@@ -172,7 +184,7 @@ def load_maps(bytes, hex_offset):
     increment += 1
     offset = bank_pointer
     next_pointer = bank_pointers[i + 1] if (i + 1) < len(bank_pointers) else 0
-    if increment == 42:
+    if increment == 1000: # 42
       break
 
     maps = []
@@ -201,6 +213,22 @@ def load_maps(bytes, hex_offset):
     banks.append(maps)
 
   return banks
+
+def get_longest_connection(map_data):
+  connections = [[y['connections'] for y in x] for x in map_data]
+  adj = {}
+  n = 0
+  l_max = 0
+  chosen = None
+  for map_bank in range(len(connections)):
+    for map_number in range(len(connections[map_bank])):
+      n+=1
+      for connection in connections[map_bank][map_number]:
+        l = len(calculate_map_offsets(map_data, map_bank, map_number))
+        l_max = max(l, l_max)
+        if l == l_max:
+          chosen = (map_bank, map_number)
+  return chosen
 
 def read_connections(bytes, map_data):
   cs = []
@@ -293,7 +321,7 @@ def read_tileset(bytes, tileset_pointer):
 
   offset = read_pointer(bytes, tileset_pointer + 12)
   end = read_pointer(bytes, tileset_pointer + 20)
-  if GAME == 'em':
+  if GAME in ['em', 'ru', 'sa']:
     end = read_pointer(bytes, tileset_pointer + 16)
   total_blocks = (end - offset) / 16
   debug('trying to read {} blocks'.format(total_blocks))
@@ -328,15 +356,18 @@ def draw_block(map_pixels, palettes, tiles, blocks, x, y, block_num):
   # The first four tiles are the bottom tiles and the last four are the top
   # ones. The top tiles also have a mask to them, so we have to draw them
   # differently.
-  block = blocks[block_num]
-  for i, (palette, tile, attributes) in enumerate(block):
-    x_offset = (i % 2) * 8
-    y_offset = int((i % 4) / 2) * 8
-    if tile <= len(tiles):
-      draw_tile(map_pixels, palettes[palette], tiles[tile],
-        x + x_offset, y + y_offset, attributes, i >= 4)
-    else:
-      print('Tileerror')
+  if block_num < len(blocks):
+    block = blocks[block_num]
+    for i, (palette, tile, attributes) in enumerate(block):
+      x_offset = (i % 2) * 8
+      y_offset = int((i % 4) / 2) * 8
+      if tile < len(tiles):
+        draw_tile(map_pixels, palettes[palette], tiles[tile],
+          x + x_offset, y + y_offset, attributes, i >= 4)
+      else:
+        print('Tileerror')
+  else:
+    print('Blockerror')
 
 def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
   x_flip = attributes & 0x1
@@ -359,6 +390,8 @@ def draw_map(map_pixels, bytes, map_, xx, yy):
   if read_pointer(bytes, map_) < 0:
     return
   (width, height, label, tile_sprites, global_pointer, local_pointer) = read_map(bytes, map_)
+  if global_pointer < 0 or local_pointer < 0:
+    return label
   (palettes, tiles, blocks) = read_tileset(bytes, global_pointer)
   (extra_palettes, extra_tiles, extra_blocks) = read_tileset(bytes, local_pointer)
   palettes.extend(extra_palettes)
@@ -402,13 +435,17 @@ def calculate_map_offsets(maps, bank_num, map_num):
 
     coords = [(map_id, coord)]
     for c in maps[bank][map_]['connections']:
-      coords.extend(calculate_helper(
-        (c['map_bank'], c['map_number']),
-        map_id,
-        coord,
-        c['direction'],
-        c['offset'],
-      ))
+      try:
+        coords.extend(calculate_helper(
+          (c['map_bank'], c['map_number']),
+          map_id,
+          coord,
+          c['direction'],
+          c['offset'],
+        ))
+      except Exception as e:
+        print(e)
+
     return coords
 
   return calculate_helper(
