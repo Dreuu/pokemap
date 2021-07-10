@@ -4,12 +4,16 @@ import struct
 import sys
 import argparse
 import os
+from multiprocessing import Pool
+import numpy as np
+import time
 
 def debug(*args, **kwargs):
   if DEBUG_MODE:
     print(*args, **kwargs)
 
 def main():
+  global THREAD_COUNT
   global DEBUG_MODE
   global GAME
   global frOffsets
@@ -18,11 +22,15 @@ def main():
   global ruOffsets
   global saOffsets
   global gameIdOffset
-
+  
+  THREAD_COUNT = None
   DEBUG_MODE = False
   frOffsets = {'strings':'0x3eecfc', 'banks':'0x3526A8'} # For hacks, check pointer at 0x5524C
-  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x3528DC'} # Gaia - Broken but working
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x3528DC'} # Gaia - Broken image
   #frOffsets = {'strings':'0x3eecfc', 'banks':'0xB70498'} # Unbound - Not working
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x71C8AC'} # Shiny Gold Sigma - Broken image
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x73E2F4'} # AshGray - Not working
+  #frOffsets = {'strings':'0x3eecfc', 'banks':'0x5524C'} # Will implement reading bank offset from this pointer
   lgOffsets = {'strings':'0x3eecfc', 'banks':'0x352688'} # Wrong strings offset
   emOffsets = {'strings':'0x5A0B2C', 'banks':'0x486578'} # For hacks, check pointer at 0x84AA4
   ruOffsets = {'strings':'0x5A0B2C', 'banks':'0x308588'} # Wrong strings offset
@@ -43,9 +51,15 @@ def main():
   parser.add_argument("-g","--game",
                       help="Specify which game the ROM contains. Options are 'fr' and 'em'",
                       default=None)
+  parser.add_argument("-t","--thread_count",
+                      help="Number of CPU threads to use",
+                      default=None)
   args = parser.parse_args()
 
   GAME = args.game
+  
+  if args.thread_count is not None:
+    THREAD_COUNT = int(args.thread_count)
 
   if args.verbose:
     DEBUG_MODE = True
@@ -89,7 +103,9 @@ def main():
   
   strings = load_strings(bytes, chosenROM['strings'])
   debug('Found all these strings: {}'.format([x.encode('utf-8') for x in strings]))
-  banks = load_maps(bytes, chosenROM['banks'])
+  # bank_pointer = hex(read_pointer(bytes, int(chosenROM['banks'],16))) # Automatically find pointer
+  bank_pointer = chosenROM['banks']
+  banks = load_maps(bytes, bank_pointer)
   map_bank, map_number = get_longest_connection(banks)
   offsets = calculate_map_offsets(banks, map_bank, map_number)
   min_x = min([x for ((m, b), (x, y)) in offsets])
@@ -102,18 +118,34 @@ def main():
   x_orig = min_x * 16
   y_orig = min_y * 16
 
-  map_im = Image.new(mode="RGBA", size=(width, height), color=(255,0,255,0))
-  map_pixels = map_im.load()
+  map_ims = []
+  coords = []
+  if THREAD_COUNT is not None:
+    inputs = []
+    for idx, ((m, b), (x, y)) in enumerate(offsets):
+      inputs.append((bytes, banks[m][b]['map_data'], idx))
+      coords.append(((x - min_x) * 16, (y - min_y) * 16))
+    with Pool(THREAD_COUNT) as p:
+      map_ims = p.starmap(draw_map, inputs)
+  else:
+    current = 1
+    offset_count = len(offsets)
+    for ((m, b), (x, y)) in offsets:
+      print(f'Drawing map {current}/{offset_count}', end='\r')
+      map_ims.append(draw_map(bytes, banks[m][b]['map_data']))
+      coords.append(((x - min_x) * 16, (y - min_y) * 16))
+      current += 1
+  for idx in range(len(map_ims)):
+    if map_ims[idx] is not None:
+      map_ims[idx] = Image.fromarray(map_ims[idx], 'RGBA')
 
-  # Recursively finds maps surrounding initial one
-  # Requires the overworld to be connected using one long sequential path
-  # Could manually add all required OW maps maybe?
-  current = 1
-  offset_count = len(offsets)
-  for ((m, b), (x, y)) in offsets:
-    print(f'Drawing map {current}/{offset_count}', end='\r')
-    draw_map(map_pixels, bytes, banks[m][b]['map_data'], (x - min_x) * 16, (y - min_y) * 16)
-    current += 1
+  map_im = Image.new(mode="RGBA", size=(width, height), color=(255,0,255,0))
+
+  for idx, im in enumerate(map_ims):
+    if im is None:
+      continue
+    x, y = coords[idx]
+    map_im.paste(im, (x,y))
     
   print('\n\nSaving Image:',args.outfile,'\n')
   if args.outfile.split('.')[-1] == 'jpeg': # No transparency
@@ -168,9 +200,6 @@ def load_maps(bytes, hex_offset):
   bank_pointers = []
   while is_pointer(bytes, offset):
     bank_pointer = read_pointer(bytes, offset)
-    #if bank_pointer == 4160749567:
-    #  pass
-    #else:
     bank_pointers.append(bank_pointer)
     offset = offset + 4
 
@@ -288,7 +317,10 @@ def read_tileset(bytes, tileset_pointer):
   debug('Tileset compressed: {}, primary: {}'.format(attribs[0], attribs[1]))
   primary = attribs[1]
   tileset_image_pointer = read_pointer(bytes, tileset_pointer + 4)
-  image = nlzss.lzss3.decompress_bytes(bytes[tileset_image_pointer:])
+  try:
+    image = nlzss.lzss3.decompress_bytes(bytes[tileset_image_pointer:])
+  except:
+    return (None, None, None)
 
   tiles = []
   for i in range(0, len(image), 32):
@@ -361,7 +393,7 @@ def draw_block(map_pixels, palettes, tiles, blocks, x, y, block_num):
     for i, (palette, tile, attributes) in enumerate(block):
       x_offset = (i % 2) * 8
       y_offset = int((i % 4) / 2) * 8
-      if tile < len(tiles):
+      if tile < len(tiles) and palette < len(palettes):
         draw_tile(map_pixels, palettes[palette], tiles[tile],
           x + x_offset, y + y_offset, attributes, i >= 4)
       else:
@@ -384,24 +416,34 @@ def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
     if mask_mode and px == 0:
       continue
     colour = palette[px]
-    map_pixels[x + x_offset, y + y_offset] = colour + (255,)
+    map_pixels[y + y_offset, x + x_offset] = colour + (255,)
 
-def draw_map(map_pixels, bytes, map_, xx, yy):
+def draw_map(bytes, map_, print_info=None):
+  multi = True if print_info is not None else False
+  if multi:
+    map_num = print_info
+    print(f'Drawing map {map_num}')
+
   if read_pointer(bytes, map_) < 0:
-    return
+    return None
   (width, height, label, tile_sprites, global_pointer, local_pointer) = read_map(bytes, map_)
+
+  map_pixels = np.full(( height*16,width*16, 4), [0,0,0,0], dtype="uint8")
+
   if global_pointer < 0 or local_pointer < 0:
-    return label
+    return None
+
   (palettes, tiles, blocks) = read_tileset(bytes, global_pointer)
-  (extra_palettes, extra_tiles, extra_blocks) = read_tileset(bytes, local_pointer)
-  palettes.extend(extra_palettes)
-  tiles.extend(extra_tiles)
-  blocks.extend(extra_blocks)
+  if None not in [palettes, tiles, blocks]:
+    (extra_palettes, extra_tiles, extra_blocks) = read_tileset(bytes, local_pointer)
+    if None not in [extra_palettes, extra_tiles, extra_blocks]:
+      palettes.extend(extra_palettes)
+      tiles.extend(extra_tiles)
+      blocks.extend(extra_blocks)
+    for (x, y) in tile_sprites:
+      draw_block(map_pixels, palettes, tiles, blocks, 0 + x*16, 0 + y*16, tile_sprites[(x, y)])
 
-  for (x, y) in tile_sprites:
-    draw_block(map_pixels, palettes, tiles, blocks, xx + x * 16, yy + y * 16, tile_sprites[(x, y)])
-
-  return label
+  return map_pixels
 
 # Returns a set of maps and (x, y) coordinates that the maps should be drawn at.
 # The (x, y) coordinates are specified in blocks, not pixels.
@@ -487,4 +529,6 @@ def CheckExt(choices):
   return Act
 
 if __name__ == '__main__':
+  start = time.time()
   main()
+  print('Done in',round(time.time()-start,2),'seconds')
