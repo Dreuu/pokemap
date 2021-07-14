@@ -67,7 +67,7 @@ def main():
     parser.add_argument(
         "-d",
         "--draw",
-        help="Which maps to draw. Options are A/a for all maps, and G/g \
+        help="Which maps to draw. Options are 'all' for all maps, and 'group' \
                             for only map groups. If given any other value, only the \
                             largest map group will be drawn (Default)",
         default="",
@@ -78,6 +78,8 @@ def main():
 
     if args.thread_count is not None:
         THREAD_COUNT = int(args.thread_count)
+    else:
+      print("Using option '-t THREAD_COUNT' is highly recommended to improve performance!")
 
     if args.verbose:
         DEBUG_MODE = True
@@ -85,7 +87,6 @@ def main():
     print()
     print("Reading ROM:", args.rom_file)
     bytes = load_rom(args.rom_file)
-    print()
 
     # Set default GAME type based on hex header
     # BPRE, BPGE, BPEE...
@@ -117,10 +118,7 @@ def main():
 
     # Set default output filename
     if args.outfile is None:
-        args.outfile = f"{GAME}.png"
-
-    if not os.path.exists(args.outfile.split(".")[0]):
-        os.makedirs(args.outfile.split(".")[0])
+        args.outfile = f"{GAME}_map.png"
 
     # strings = load_strings(bytes, chosenROM['strings'])
     # debug('Found all these strings: {}'.format([x.encode('utf-8') for x in strings]))
@@ -128,73 +126,110 @@ def main():
         read_pointer(bytes, int(chosenROM["banks"], 16))
     )  # Automatically find pointer
     banks = load_maps(bytes, bank_pointer)
-    group_list = get_seeds(banks, args.draw)
+
+    group_list, single_list = get_seeds(banks, args.draw)
     group_count = len(group_list)
-    pic_count = 1
     for group_num, (map_bank, map_number) in enumerate(group_list, start=1):
-        print(f"Drawing map {group_num}/{group_count}")
-        offsets = calculate_map_offsets(banks, map_bank, map_number)
-        min_x = min([x for ((m, b), (x, y)) in offsets])
-        min_y = min([y for ((m, b), (x, y)) in offsets])
-        max_x = max([x + banks[m][b]["width"] for ((m, b), (x, y)) in offsets])
-        max_y = max([y + banks[m][b]["height"] for ((m, b), (x, y)) in offsets])
+      print(f"\nDrawing Group {group_num}/{group_count}")
+      draw_maps((map_bank, map_number), banks, bytes, group_num, args, True)
 
-        width = (max_x - min_x) * 16
-        height = (max_y - min_y) * 16
-        x_orig = min_x * 16
-        y_orig = min_y * 16
+    single_count = len(single_list)
+    rjust = len(str(single_count))
+    if THREAD_COUNT is None:
+      pic_num = 1
+      for idx, (map_bank, map_number) in enumerate(single_list, start=1):
+        #print(f"Drawing Map {map_bank}.{map_number}")
+        print(f"-{single_count-idx} maps left{' '*5}", end='\r')
+        pic_num += draw_maps((map_bank, map_number), banks, bytes, str(pic_num).rjust(rjust,'0'), args, False)
+    else:
+        inputs = [((map_bank, map_number), banks, bytes, str(idx).rjust(rjust,'0'), args, False) 
+                  for idx, (map_bank, map_number) in enumerate(single_list, start=1)]
+        with Pool(THREAD_COUNT) as p:
+          p.starmap(draw_maps, inputs)
+        
 
-        map_ims = []
-        coords = []
-        if THREAD_COUNT is not None and len(offsets) > 1:
-            inputs = []
-            for idx, ((m, b), (x, y)) in enumerate(offsets):
-                inputs.append((bytes, banks[m][b]["map_data"], idx))
-                coords.append(((x - min_x) * 16, (y - min_y) * 16))
-            with Pool(THREAD_COUNT) as p:
-                map_ims = p.starmap(draw_map, inputs)
-        else:
-            current = 1
-            offset_count = len(offsets)
-            for ((m, b), (x, y)) in offsets:
-                print(f"Drawing map {current}/{offset_count}", end="\r")
-                map_ims.append(draw_map(bytes, banks[m][b]["map_data"]))
-                coords.append(((x - min_x) * 16, (y - min_y) * 16))
-                current += 1
-        for idx in range(len(map_ims)):
-            if map_ims[idx] is not None:
-                map_ims[idx] = Image.fromarray(map_ims[idx], "RGBA")
+def draw_maps(map_addr, banks, bytes, num, args, is_group):
+  map_bank, map_number = map_addr
+  offsets = calculate_map_offsets(banks, map_bank, map_number)
 
-        if width > 16000 or height > 16000:
-            continue
-        map_im = Image.new(mode="RGBA", size=(width, height), color=(64, 64, 64, 255))
+  map_ims, coords, width, height = get_map_parts(banks, bytes, offsets, is_group)
 
-        for idx, im in enumerate(map_ims):
-            if im is None:
-                continue
-            x, y = coords[idx]
-            map_im.paste(im, (x, y))
+  if None in [map_ims, coords, width, height]:
+      return 0
 
-        outfile = args.outfile.split(".")
-        ext = outfile[-1]
-        dir = outfile[0]
-        outfile = outfile[:-1]
-        outfile = "".join(outfile)
-        if group_count > 1:
-            outfile = dir + "/" + outfile
-        if len(offsets) <= 1:
-            outfile += f"_{pic_count}-{map_bank}_{map_number}"
-        else:
-            outfile += "-group" + str(pic_count)
-        outfile += "." + ext
-        if ext == "jpeg":  # No transparency
-            map_im = map_im.convert("RGB")
-        print("\n\nSaving Image:", outfile, "\n")
-        try:
-            map_im.save(outfile, outfile.split(".")[-1])
-            pic_count += 1
-        except:
-            pass
+  map_im = Image.new(mode="RGBA", size=(width, height), color=(64, 64, 64, 255))
+
+  for idx, im in enumerate(map_ims):
+    if im is None:
+        continue
+    x, y = coords[idx]
+    map_im.paste(im, (x, y))
+
+  outfile = args.outfile.split(".")
+  ext = outfile[-1]
+  dir = outfile[0]
+  outfile = outfile[:-1]
+  outfile = "".join(outfile)
+  if not is_group:
+    outfile += f"_{num}-{map_bank}_{map_number}"
+  if args.draw.upper() in ['A', 'G', 'ALL', 'GROUP', 'GROUPS']:
+    if not os.path.exists(args.outfile.split(".")[0]):
+      os.makedirs(args.outfile.split(".")[0])
+    outfile = dir + "/" + outfile
+    if is_group:
+      outfile += "-group" + str(num)
+  outfile += "." + ext
+  if ext == "jpeg":  # No transparency
+    map_im = map_im.convert("RGB")
+  print("Saving Image:", outfile)
+  try:
+    map_im.save(outfile, outfile.split(".")[-1])
+    return 1
+  except:
+    return 0
+
+
+def get_map_parts(banks, bytes, offsets, is_group):
+  try:
+    min_x = min([x for ((m, b), (x, y)) in offsets])
+    min_y = min([y for ((m, b), (x, y)) in offsets])
+  except ValueError as e:
+    return None, None, None, None
+
+  max_x = max([x + banks[m][b]["width"] for ((m, b), (x, y)) in offsets])
+  max_y = max([y + banks[m][b]["height"] for ((m, b), (x, y)) in offsets])
+
+  width = (max_x - min_x) * 16
+  height = (max_y - min_y) * 16
+  if width > 16000 or height > 16000:
+    return None, None, None, None
+  x_orig = min_x * 16
+  y_orig = min_y * 16
+
+  map_ims = []
+  coords = []
+  if THREAD_COUNT is not None and len(offsets) > 1 and is_group:
+    print(f'{len(offsets)} Maps')
+    inputs = []
+    for idx, ((m, b), (x, y)) in enumerate(offsets, start=1):
+      inputs.append((bytes, banks[m][b]["map_data"], (m,b)))
+      coords.append(((x - min_x) * 16, (y - min_y) * 16))
+    with Pool(THREAD_COUNT) as p:
+      map_ims = p.starmap(draw_map, inputs)
+  else:
+    current = 1
+    offset_len = len(offsets)
+    for idx, ((m, b), (x, y)) in enumerate(offsets, start=1):
+      if is_group:
+        print(f"Drawing Map {m}.{b}")
+        print(f"-{offset_len-idx} maps left", end='\r')
+      map_ims.append(draw_map(bytes, banks[m][b]["map_data"]))
+      coords.append(((x - min_x) * 16, (y - min_y) * 16))
+      current += 1
+  for idx in range(len(map_ims)):
+    if map_ims[idx] is not None:
+        map_ims[idx] = Image.fromarray(map_ims[idx], "RGBA")
+  return map_ims, coords, width, height
 
 
 def load_rom(rom_path):
@@ -295,7 +330,6 @@ def load_maps(bytes, hex_offset):
 
 def get_seeds(map_data, draw):
     """Find groups of maps and return a single bank/number combo for each"""
-
     class Graph:
         def __init__(self):
             self.adj = {}
@@ -345,7 +379,8 @@ def get_seeds(map_data, draw):
             else:
                 width = map_data[map_bank][map_number]["width"]
                 height = map_data[map_bank][map_number]["height"]
-                single_maps.append((map_bank, map_number, width * height))
+                if width <= 16000 and height <= 16000:
+                    single_maps.append((map_bank, map_number, width * height))
 
     single_maps.sort(reverse=True, key=lambda x: x[2])
     single_maps = [(x[0], x[1]) for x in single_maps]
@@ -353,14 +388,12 @@ def get_seeds(map_data, draw):
     groups.sort(reverse=True, key=lambda x: len(x))
     groups = [x[0] for x in groups]
 
-    if draw.upper() == "A":
-        start_list = groups + single_maps
-    elif draw.upper() == "G":
-        start_list = groups
+    if draw.upper() in ["ALL","A"]:
+        return (groups, single_maps)
+    elif draw.upper() in ["G","GROUP","GROUPS"]:
+        return (groups, [])
     else:
-        start_list = [groups[0]]
-
-    return start_list
+        return ([groups[0]], [])
 
 
 def read_connections(bytes, map_data):
@@ -528,7 +561,7 @@ def draw_block(map_pixels, palettes, tiles, blocks, x, y, block_num):
                 i >= 4,
             )
         else:
-            print(f"Tileerror: Tile {tile}/{len(tiles)}, Palette {palette}/{12}")
+            print(f"TileError: Tile {tile}/{len(tiles)}, Palette {palette}/{12}")
 
 
 def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
@@ -552,8 +585,8 @@ def draw_tile(map_pixels, palette, tile, x, y, attributes, mask_mode):
 def draw_map(bytes, map_, print_info=None):
     multi = True if print_info is not None else False
     if multi:
-        map_num = print_info
-        print(f"Drawing map {map_num}")
+        m, b = print_info
+        print(f"Drawing Map {m}.{b}{' '*5}")
 
     if read_pointer(bytes, map_) < 0:
         return None
@@ -591,7 +624,7 @@ def draw_map(bytes, map_, print_info=None):
                 )
             else:
                 if not block_error:
-                    print("\nBlockerror")
+                    #print("  -BlockError")
                     block_error = True
 
     return map_pixels
@@ -610,6 +643,8 @@ def calculate_map_offsets(maps, bank_num, map_num):
         (c_bank, c_map) = caller_id
         width = maps[bank][map_]["width"]
         height = maps[bank][map_]["height"]
+        if width > 16000 or height > 16000:
+            return []
         c_width = maps[c_bank][c_map]["width"]
         c_height = maps[c_bank][c_map]["height"]
         visited[map_id] = True
